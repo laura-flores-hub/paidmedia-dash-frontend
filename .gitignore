@@ -1,0 +1,61 @@
+# Credentials and env variables
+.env
+client_secret.json
+google-ads.yaml
+generate_user_credentials.py
+.env.*
+!.env.example
+*.log
+!google-ads.example.yaml
+
+# Google's service key
+service_account.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# venvs
+.venv/
+venv/
+env/
+ENV/
+
+# IDEs
+##.vscode/
+##.idea/
+##*.sublime-project
+##*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests and temp files
+testes_anteriores
+##jsons
+versoes-anteriores.md
+temp
+/outputs
+/consolidation
+
+## Raw data exports (large files)
+*.json
+!frontend/**/*.json
+logs
+*.csv
+old-extractions
+hubspot_eventos
+
+
+# Analysis outputs
+##inbound_report.html
+##.vercel
+##hubspot_eventos/*.jsonl
