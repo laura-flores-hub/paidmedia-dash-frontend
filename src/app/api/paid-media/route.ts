@@ -1,9 +1,34 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseClient } from '@/lib/supabase'
-import type { Platform, RawSpendRow, CampaignSummary, GeoOptions } from '@/types/paid-media'
+import type {
+  Platform,
+  RawSpendRow,
+  CampaignSummary,
+  GeoOptions,
+  OrganicChannel,
+  LeadsAttributionSummary,
+} from '@/types/paid-media'
 
 const PLATFORMS: Platform[] = ['google', 'meta', 'linkedin']
 const PAGE_SIZE = 1000
+// How long a given query result stays served from cache before Supabase is
+// hit again. This is what actually fixes the slowness — previously every
+// request re-ran the full paginated reads below with no caching layer at
+// all. A plain in-memory cache is used (rather than Next's unstable_cache)
+// because the raw rows fetched here can exceed unstable_cache's 2MB per-entry
+// limit as the underlying tables grow.
+const CACHE_TTL_MS = 5 * 60 * 1000
+
+const memoryCache = new Map<string, { data: unknown; expiresAt: number }>()
+
+async function withCache<T>(key: string, fetcher: () => Promise<T>): Promise<T> {
+  const hit = memoryCache.get(key)
+  if (hit && hit.expiresAt > Date.now()) return hit.data as T
+
+  const data = await fetcher()
+  memoryCache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS })
+  return data
+}
 
 function currencyKey(platform: string, adAccountId: string) {
   return `${platform.toLowerCase()}::${adAccountId.toLowerCase()}`
@@ -33,13 +58,16 @@ async function fetchAllRows<T>(
   return all
 }
 
-async function fetchCurrencyMap(): Promise<Map<string, string>> {
+async function fetchCurrencyRows(): Promise<{ platform: string; ad_account_id: string; currency: string }[]> {
   const supabase = getSupabaseClient()
-  const data = await fetchAllRows<{ platform: string; ad_account_id: string; currency: string }>(
+  return fetchAllRows<{ platform: string; ad_account_id: string; currency: string }>(
     () => supabase.from('static_rules_geo_validation_ads_accounts').select('platform, ad_account_id, currency'),
     'static_rules_geo_validation_ads_accounts'
   )
+}
 
+async function fetchCurrencyMap(): Promise<Map<string, string>> {
+  const data = await withCache('currency-rows', fetchCurrencyRows)
   const map = new Map<string, string>()
   for (const row of data) {
     map.set(currencyKey(row.platform, row.ad_account_id), row.currency)
@@ -103,23 +131,23 @@ async function fetchGeoChunk(
 // statement timeout well before reaching the end of the table. An indexed
 // `campaign_id IN (...)` filter stays fast, so we only ever look up the
 // campaigns that actually appear in the spend data for this request.
-async function fetchGeoBridge(campaignIds: string[]): Promise<{
-  byCampaign: Map<string, GeoEntry>
-  geoOptions: GeoOptions
-}> {
-  const byCampaign = new Map<string, GeoEntry>()
-  const regions = new Set<string>()
-  const countriesByRegion: Record<string, Set<string>> = {}
-
-  if (campaignIds.length === 0) {
-    return { byCampaign, geoOptions: { regions: [], countriesByRegion: {} } }
-  }
+async function fetchGeoRows(campaignIds: string[]): Promise<GeoRow[]> {
+  if (campaignIds.length === 0) return []
 
   const supabase = getSupabaseClient()
   const chunks = chunk(campaignIds, GEO_CHUNK_SIZE)
 
   const results = await runWithConcurrency(chunks, GEO_CONCURRENCY, (ids) => fetchGeoChunk(supabase, ids))
-  const data: GeoRow[] = results.flat()
+  return results.flat()
+}
+
+function buildGeoBridge(data: GeoRow[]): {
+  byCampaign: Map<string, GeoEntry>
+  geoOptions: GeoOptions
+} {
+  const byCampaign = new Map<string, GeoEntry>()
+  const regions = new Set<string>()
+  const countriesByRegion: Record<string, Set<string>> = {}
 
   for (const row of data) {
     const campaignId: string = row.campaign_id
@@ -158,6 +186,15 @@ async function fetchGeoBridge(campaignIds: string[]): Promise<{
   }
 
   return { byCampaign, geoOptions }
+}
+
+async function fetchGeoBridge(campaignIds: string[]): Promise<{
+  byCampaign: Map<string, GeoEntry>
+  geoOptions: GeoOptions
+}> {
+  const sortedIds = [...campaignIds].sort()
+  const data = await withCache(`geo-rows::${sortedIds.join(',')}`, () => fetchGeoRows(sortedIds))
+  return buildGeoBridge(data)
 }
 
 async function fetchGoogle(from: string | null, to: string | null): Promise<RawSpendRow[]> {
@@ -235,10 +272,206 @@ const FETCHERS: Record<Platform, typeof fetchGoogle> = {
   linkedin: fetchLinkedin,
 }
 
+function normalize(value: string | null | undefined): string {
+  return (value ?? '').trim().toLowerCase()
+}
+
+// Maps a HubSpot form's utm_source to one of the ad platforms this dashboard
+// tracks. Anything else (email, AI agents, referrals, ...) is organic.
+function platformFromUtmSource(utmSource: string | null): Platform | null {
+  const s = normalize(utmSource)
+  if (['facebook', 'meta', 'instagram'].includes(s)) return 'meta'
+  if (s === 'linkedin') return 'linkedin'
+  if (['google', 'adwords', 'youtube'].includes(s)) return 'google'
+  return null
+}
+
+function hostnameOf(url: string | null): string | null {
+  if (!url) return null
+  try {
+    return new URL(url).hostname.toLowerCase()
+  } catch {
+    return null
+  }
+}
+
+function classifyOrganicChannel(utmSource: string | null, referrer: string | null): OrganicChannel {
+  const s = normalize(utmSource)
+
+  if (s === 'hs_email') return 'email'
+  if (s === 'chatgpt.com' || s === 'copilot.com') return 'agentes_ia'
+  if (s === 'hs_automation' || s === 'th' || s === 'jotform' || s === 'ooh') return 'outros'
+
+  if (!s) {
+    const host = hostnameOf(referrer)
+    if (!host) return 'trafego_direto'
+    if (/(^|\.)(google|bing|duckduckgo)\./.test(host)) return 'busca_organica'
+    if (/(^|\.)(facebook|instagram|linkedin|twitter|x|tiktok)\./.test(host)) return 'social_media'
+    return 'referral'
+  }
+
+  return 'outros'
+}
+
+type LeadFormRow = {
+  contact_id: string | null
+  forms_hs_utm_source: string | null
+  forms_hs_utm_campaign: string | null
+  forms_hsa_cam: string | null
+  forms_hs_referrer: string | null
+}
+
+async function fetchLeadFormRows(from: string | null, to: string | null): Promise<LeadFormRow[]> {
+  const supabase = getSupabaseClient()
+  return fetchAllRows<LeadFormRow>(() => {
+    let query = supabase
+      .from('data_hs_forms_conversions_consolidated_v1')
+      .select('contact_id, forms_hs_utm_source, forms_hs_utm_campaign, forms_hsa_cam, forms_hs_referrer, submitted_at')
+    if (from) query = query.gte('submitted_at', from)
+    if (to) query = query.lte('submitted_at', to)
+    return query
+  }, 'data_hs_forms_conversions_consolidated_v1')
+}
+
+type CampaignKeyRow = { platform: string; campaign_name: string; campaign_id: string }
+
+async function fetchCampaignKeyRows(): Promise<CampaignKeyRow[]> {
+  const supabase = getSupabaseClient()
+  return fetchAllRows<CampaignKeyRow>(
+    () => supabase.from('validation_ads_campaign_keys_v2').select('platform, campaign_name, campaign_id'),
+    'validation_ads_campaign_keys_v2'
+  )
+}
+
+function campaignKeyLookupKey(platform: Platform, campaignName: string): string {
+  return `${platform}::${normalize(campaignName)}`
+}
+
+type LeadsAttributionResult = {
+  leadsByCampaignId: Map<string, number>
+  contactToCampaignId: Map<string, string>
+  attribution: LeadsAttributionSummary
+}
+
+async function fetchLeadsAttribution(from: string | null, to: string | null): Promise<LeadsAttributionResult> {
+  const [leadRows, campaignKeyRows] = await Promise.all([
+    withCache(`lead-form-rows::${from}::${to}`, () => fetchLeadFormRows(from, to)),
+    withCache('campaign-key-rows', fetchCampaignKeyRows),
+  ])
+
+  const campaignKeyMap = new Map<string, string>()
+  for (const row of campaignKeyRows) {
+    campaignKeyMap.set(campaignKeyLookupKey(row.platform.toLowerCase() as Platform, row.campaign_name), row.campaign_id)
+  }
+
+  const leadsByCampaignId = new Map<string, number>()
+  // First lead (in fetch order) per contact that resolved to a campaign —
+  // used to attribute HubSpot deals (which only carry contact_ids) back to a
+  // campaign/platform/region for the KPI filters.
+  const contactToCampaignId = new Map<string, string>()
+  const unattributedByPlatform: Partial<Record<Platform, number>> = {}
+  const organicByChannel: Partial<Record<OrganicChannel, number>> = {}
+
+  for (const row of leadRows) {
+    const hsaCam = (row.forms_hsa_cam ?? '').trim()
+
+    if (hsaCam) {
+      leadsByCampaignId.set(hsaCam, (leadsByCampaignId.get(hsaCam) ?? 0) + 1)
+      if (row.contact_id && !contactToCampaignId.has(row.contact_id)) {
+        contactToCampaignId.set(row.contact_id, hsaCam)
+      }
+      continue
+    }
+
+    const platform = platformFromUtmSource(row.forms_hs_utm_source)
+    if (platform) {
+      const lookupKey = campaignKeyLookupKey(platform, row.forms_hs_utm_campaign ?? '')
+      const resolvedId = campaignKeyMap.get(lookupKey)
+      if (resolvedId) {
+        leadsByCampaignId.set(resolvedId, (leadsByCampaignId.get(resolvedId) ?? 0) + 1)
+        if (row.contact_id && !contactToCampaignId.has(row.contact_id)) {
+          contactToCampaignId.set(row.contact_id, resolvedId)
+        }
+      } else {
+        unattributedByPlatform[platform] = (unattributedByPlatform[platform] ?? 0) + 1
+      }
+      continue
+    }
+
+    const channel = classifyOrganicChannel(row.forms_hs_utm_source, row.forms_hs_referrer)
+    organicByChannel[channel] = (organicByChannel[channel] ?? 0) + 1
+  }
+
+  const unattributedTotal = Object.values(unattributedByPlatform).reduce((sum, n) => sum + (n ?? 0), 0)
+  const organicTotal = Object.values(organicByChannel).reduce((sum, n) => sum + (n ?? 0), 0)
+
+  return {
+    leadsByCampaignId,
+    contactToCampaignId,
+    attribution: {
+      unattributedPaid: { total: unattributedTotal, byPlatform: unattributedByPlatform },
+      organic: { total: organicTotal, byChannel: organicByChannel },
+    },
+  }
+}
+
+type DealRow = {
+  hs_object_id: string
+  contact_ids: string[] | null
+  first_meeting_status: string | null
+}
+
+const VALIDATED_MEETING_STATUS = 'Validated'
+
+async function fetchDealRows(leadsFrom: string | null, leadsTo: string | null): Promise<DealRow[]> {
+  const supabase = getSupabaseClient()
+  return fetchAllRows<DealRow>(() => {
+    let query = supabase.from('data_hs_deals_v2').select('hs_object_id, contact_ids, first_meeting_status, createdate')
+    if (leadsFrom) query = query.gte('createdate', leadsFrom)
+    if (leadsTo) query = query.lte('createdate', leadsTo)
+    return query
+  }, 'data_hs_deals_v2')
+}
+
+type DealsKpi = { leadsTotal: number; validatedDeals: number }
+
+// A deal only carries contact_ids, not a campaign — it's attributed via the
+// first associated contact that itself resolved to a campaign (same
+// resolution as fetchLeadsAttribution), then kept only if that campaign is
+// part of the currently filtered campaign set (platform/region/country).
+function computeDealsKpi(
+  dealRows: DealRow[],
+  contactToCampaignId: Map<string, string>,
+  filteredCampaignIds: Set<string>,
+  leadsTotal: number
+): DealsKpi {
+  let validatedDeals = 0
+
+  for (const deal of dealRows) {
+    const campaignId = (deal.contact_ids ?? [])
+      .map((contactId) => contactToCampaignId.get(contactId))
+      .find((id): id is string => Boolean(id))
+
+    if (!campaignId || !filteredCampaignIds.has(campaignId)) continue
+    if (deal.first_meeting_status === VALIDATED_MEETING_STATUS) validatedDeals += 1
+  }
+
+  return { leadsTotal, validatedDeals }
+}
+
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams
   const from = searchParams.get('from')
   const to = searchParams.get('to')
+  // Ad spend tables (date/date_start) are already keyed by ad-platform report
+  // day, so `from`/`to` are used as-is for them. Lead timestamps
+  // (submitted_at) are stored in UTC, so counting them by day requires the
+  // caller's local-timezone day boundaries — leadsFrom/leadsTo carry those as
+  // full ISO instants, computed client-side from the browser's timezone, so
+  // a day's lead volume here matches what the platform (e.g. Meta) shows for
+  // that same local day. Falls back to from/to for direct/manual API calls.
+  const leadsFrom = searchParams.get('leadsFrom') ?? from
+  const leadsTo = searchParams.get('leadsTo') ?? to
   const platformParam = searchParams.get('platform')
   const regionParam = searchParams.get('region')
   const countryParam = searchParams.get('country')
@@ -253,9 +486,15 @@ export async function GET(request: NextRequest) {
   const platformsToFetch: Platform[] = platformParam ? [platformParam as Platform] : PLATFORMS
 
   try {
-    const [spendResults, currencyMap] = await Promise.all([
-      Promise.all(platformsToFetch.map((platform) => FETCHERS[platform](from, to))),
+    const [spendResults, currencyMap, leads, dealRows] = await Promise.all([
+      Promise.all(
+        platformsToFetch.map((platform) =>
+          withCache(`spend::${platform}::${from}::${to}`, () => FETCHERS[platform](from, to))
+        )
+      ),
       fetchCurrencyMap(),
+      fetchLeadsAttribution(leadsFrom, leadsTo),
+      withCache(`deal-rows::${leadsFrom}::${leadsTo}`, () => fetchDealRows(leadsFrom, leadsTo)),
     ])
     const rawRows = spendResults.flat()
     const campaignIds = [...new Set(rawRows.map((row) => row.campaign_id))]
@@ -296,8 +535,14 @@ export async function GET(request: NextRequest) {
           spend: row.spend,
           region: geoEntry?.region ?? null,
           countries: geoEntry ? [...geoEntry.countries] : [],
+          leads: leads.leadsByCampaignId.get(row.campaign_id) ?? 0,
+          cpl: null,
         })
       }
+    }
+
+    for (const summary of aggregated.values()) {
+      summary.cpl = summary.leads > 0 ? summary.spend / summary.leads : null
     }
 
     let data = [...aggregated.values()]
@@ -309,6 +554,10 @@ export async function GET(request: NextRequest) {
       data = data.filter((row) => row.countries.includes(countryParam))
     }
 
+    const filteredCampaignIds = new Set(data.map((row) => row.campaign_id))
+    const leadsTotal = data.reduce((sum, row) => sum + row.leads, 0)
+    const kpis = computeDealsKpi(dealRows, leads.contactToCampaignId, filteredCampaignIds, leadsTotal)
+
     return NextResponse.json({
       data,
       meta: {
@@ -319,6 +568,8 @@ export async function GET(request: NextRequest) {
         country: countryParam ?? null,
         count: data.length,
         geoOptions: geo.geoOptions,
+        leadsAttribution: leads.attribution,
+        kpis,
       },
     })
   } catch (error) {

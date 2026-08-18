@@ -17,11 +17,42 @@ export type CampaignSummary = {
   spend: number
   region: string | null
   countries: string[]
+  leads: number
+  cpl: number | null
 }
 
 export type GeoOptions = {
   regions: string[]
   countriesByRegion: Record<string, string[]>
+}
+
+export type OrganicChannel =
+  | 'email'
+  | 'agentes_ia'
+  | 'busca_organica'
+  | 'referral'
+  | 'social_media'
+  | 'trafego_direto'
+  | 'outros'
+
+export type UnattributedBreakdown = {
+  total: number
+  byPlatform: Partial<Record<Platform, number>>
+}
+
+export type OrganicBreakdown = {
+  total: number
+  byChannel: Partial<Record<OrganicChannel, number>>
+}
+
+export type LeadsAttributionSummary = {
+  unattributedPaid: UnattributedBreakdown
+  organic: OrganicBreakdown
+}
+
+export type DealsKpi = {
+  leadsTotal: number
+  validatedDeals: number
 }
 
 export type PaidMediaResponse = {
@@ -34,6 +65,8 @@ export type PaidMediaResponse = {
     country: string | null
     count: number
     geoOptions: GeoOptions
+    leadsAttribution: LeadsAttributionSummary
+    kpis: DealsKpi
   }
 }
 

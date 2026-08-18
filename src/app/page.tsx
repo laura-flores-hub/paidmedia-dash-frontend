@@ -2,9 +2,9 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { motion, useInView, useMotionValue, animate as fmAnimate } from 'framer-motion'
-import type { CampaignSummary, GeoOptions, Platform } from '@/types/paid-media'
+import type { CampaignSummary, DealsKpi, GeoOptions, LeadsAttributionSummary, OrganicChannel, Platform } from '@/types/paid-media'
 import { useLanguage } from '@/lib/useLanguage'
-import { LANGUAGES } from '@/lib/i18n'
+import { LANGUAGES, type TranslationKey } from '@/lib/i18n'
 import { ACCENT, CURRENCY_COLOR, EASE, PLATFORM_COLOR, SPRING, T } from '@/lib/tokens'
 
 type SortDirection = 'asc' | 'desc'
@@ -16,30 +16,127 @@ const PLATFORM_LABELS: Record<Platform, string> = {
 }
 const PLATFORM_OPTIONS: Array<Platform | 'all'> = ['all', 'google', 'meta', 'linkedin']
 
+const ORGANIC_CHANNELS: OrganicChannel[] = [
+  'email',
+  'agentes_ia',
+  'busca_organica',
+  'referral',
+  'social_media',
+  'trafego_direto',
+  'outros',
+]
+
+const EMPTY_LEADS_ATTRIBUTION: LeadsAttributionSummary = {
+  unattributedPaid: { total: 0, byPlatform: {} },
+  organic: { total: 0, byChannel: {} },
+}
+
 function formatCurrency(value: number, currency: string) {
   return `${currency} ${value.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
-function AnimatedNumber({ value, currency }: { value: number; currency: string }) {
+function formatNumber(value: number) {
+  return value.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+// Converts a plain "YYYY-MM-DD" filter into the UTC instant for the start/end
+// of that day in the browser's own timezone (no explicit offset in the
+// string means Date parses it as local time), so leads get counted by the
+// same local day the user sees in Meta/Google/LinkedIn's own interfaces.
+function localDayBoundaryToIso(dateStr: string, endOfDay: boolean): string {
+  const time = endOfDay ? '23:59:59.999' : '00:00:00.000'
+  return new Date(`${dateStr}T${time}`).toISOString()
+}
+
+function formatLocalDate(d: Date): string {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+// The period immediately preceding [from, to], with the same number of days,
+// used as the baseline for the "% change vs previous period" KPIs.
+function previousPeriodRange(from: string, to: string): { prevFrom: string; prevTo: string } {
+  const fromDate = new Date(`${from}T00:00:00`)
+  const toDate = new Date(`${to}T00:00:00`)
+  const spanDays = Math.round((toDate.getTime() - fromDate.getTime()) / 86400000) + 1
+
+  const prevTo = new Date(fromDate)
+  prevTo.setDate(prevTo.getDate() - 1)
+  const prevFrom = new Date(prevTo)
+  prevFrom.setDate(prevFrom.getDate() - (spanDays - 1))
+
+  return { prevFrom: formatLocalDate(prevFrom), prevTo: formatLocalDate(prevTo) }
+}
+
+type CurrencyAgg = { spend: Record<string, number>; leads: Record<string, number> }
+
+function aggregateByCurrency(rows: CampaignSummary[]): CurrencyAgg {
+  const spend: Record<string, number> = {}
+  const leads: Record<string, number> = {}
+  for (const row of rows) {
+    spend[row.currency] = (spend[row.currency] ?? 0) + row.spend
+    leads[row.currency] = (leads[row.currency] ?? 0) + row.leads
+  }
+  return { spend, leads }
+}
+
+function pctChange(curr: number, prev: number | null | undefined): number | null {
+  if (prev === null || prev === undefined) return null
+  if (prev === 0) return curr === 0 ? 0 : null
+  return ((curr - prev) / prev) * 100
+}
+
+function ChangeBadge({ pct }: { pct: number | null }) {
+  if (pct === null) return null
+  const flat = Math.abs(pct) < 0.05
+  const positive = pct > 0
+  const color = flat ? T.inkFaint : positive ? ACCENT.teal : '#c22f2f'
+  const arrow = flat ? '' : positive ? '↑ ' : '↓ '
+
+  return (
+    <div style={{ fontSize: 12, fontWeight: 600, color, marginTop: 6 }}>
+      {arrow}
+      {Math.abs(pct).toFixed(1)}%
+    </div>
+  )
+}
+
+function AnimatedNumber({ value, formatValue }: { value: number; formatValue: (v: number) => string }) {
   const mv = useMotionValue(0)
-  const [display, setDisplay] = useState(formatCurrency(0, currency))
+  const [display, setDisplay] = useState(formatValue(0))
 
   useEffect(() => {
     const controls = fmAnimate(mv, value, {
       duration: 1.0,
       ease: EASE,
-      onUpdate: (latest) => setDisplay(formatCurrency(latest, currency)),
+      onUpdate: (latest) => setDisplay(formatValue(latest)),
     })
     return () => controls.stop()
-  }, [value, currency])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value])
 
   return <span>{display}</span>
 }
 
-function SummaryCard({ label, value, currency, index }: { label: string; value: number; currency: string; index: number }) {
+function SummaryCard({
+  label,
+  value,
+  formatValue,
+  glowColor,
+  changePct,
+  index,
+}: {
+  label: string
+  value: number
+  formatValue: (v: number) => string
+  glowColor: string
+  changePct?: number | null
+  index: number
+}) {
   const ref = useRef(null)
   const inView = useInView(ref, { once: true, margin: '-60px' })
-  const glow = CURRENCY_COLOR[currency] ?? ACCENT.teal
 
   return (
     <motion.div
@@ -64,14 +161,15 @@ function SummaryCard({ label, value, currency, index }: { label: string; value: 
           right: -40,
           width: 120,
           height: 120,
-          background: `radial-gradient(circle, ${glow}14, transparent 70%)`,
+          background: `radial-gradient(circle, ${glowColor}14, transparent 70%)`,
           pointerEvents: 'none',
         }}
       />
       <div style={{ fontSize: 12, letterSpacing: 0.2, color: T.inkFaint, marginBottom: 8 }}>{label}</div>
       <div style={{ fontSize: 28, lineHeight: 1.3, fontWeight: 600, color: T.ink, fontVariantNumeric: 'tabular-nums' }}>
-        <AnimatedNumber value={value} currency={currency} />
+        <AnimatedNumber value={value} formatValue={formatValue} />
       </div>
+      <ChangeBadge pct={changePct ?? null} />
     </motion.div>
   )
 }
@@ -140,6 +238,95 @@ function PlatformFilterPill({
   )
 }
 
+function LeadsAttributionSection({
+  leadsAttribution,
+  t,
+}: {
+  leadsAttribution: LeadsAttributionSummary
+  t: (key: TranslationKey) => string
+}) {
+  const platformRows = PLATFORM_OPTIONS.filter((p): p is Platform => p !== 'all')
+    .map((p) => ({ label: PLATFORM_LABELS[p], count: leadsAttribution.unattributedPaid.byPlatform[p] ?? 0 }))
+    .filter((r) => r.count > 0)
+
+  const organicRows = ORGANIC_CHANNELS.map((channel) => ({
+    label: t(`channel.${channel}` as TranslationKey),
+    count: leadsAttribution.organic.byChannel[channel] ?? 0,
+  })).filter((r) => r.count > 0)
+
+  return (
+    <section
+      style={{
+        overflowX: 'auto',
+        borderRadius: 16,
+        border: `1px solid ${T.border}`,
+        background: T.surface,
+        boxShadow: T.shadow4,
+        marginTop: 24,
+      }}
+    >
+      <div style={{ padding: '16px 16px 0', fontSize: 15, fontWeight: 600, color: T.ink }}>
+        {t('leadsAttribution.title')}
+      </div>
+      <table style={{ width: '100%', minWidth: 480, textAlign: 'left', fontSize: 13, borderCollapse: 'collapse' }}>
+        <thead>
+          <tr style={{ borderBottom: `1px solid ${T.border}`, color: T.inkFaint }}>
+            <th style={{ padding: '10px 16px' }}>{t('leadsAttribution.category')}</th>
+            <th style={{ padding: '10px 16px' }}>{t('leadsAttribution.leads')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr style={{ borderBottom: `1px solid ${T.border}`, fontWeight: 600 }}>
+            <td style={{ padding: '10px 16px' }}>{t('leadsAttribution.unattributedPaid')}</td>
+            <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+              {leadsAttribution.unattributedPaid.total}
+            </td>
+          </tr>
+          {platformRows.length === 0 ? (
+            <tr style={{ borderBottom: `1px solid ${T.border}` }}>
+              <td colSpan={2} style={{ padding: '8px 16px 8px 32px', color: T.inkFaint }}>
+                {t('leadsAttribution.empty')}
+              </td>
+            </tr>
+          ) : (
+            platformRows.map((row) => (
+              <tr key={row.label} style={{ borderBottom: `1px solid ${T.border}` }}>
+                <td style={{ padding: '8px 16px 8px 32px', color: T.inkSoft }}>{row.label}</td>
+                <td style={{ padding: '8px 16px', fontVariantNumeric: 'tabular-nums', color: T.inkSoft }}>
+                  {row.count}
+                </td>
+              </tr>
+            ))
+          )}
+
+          <tr style={{ borderBottom: `1px solid ${T.border}`, fontWeight: 600 }}>
+            <td style={{ padding: '10px 16px' }}>{t('leadsAttribution.organic')}</td>
+            <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+              {leadsAttribution.organic.total}
+            </td>
+          </tr>
+          {organicRows.length === 0 ? (
+            <tr>
+              <td colSpan={2} style={{ padding: '8px 16px 8px 32px', color: T.inkFaint }}>
+                {t('leadsAttribution.empty')}
+              </td>
+            </tr>
+          ) : (
+            organicRows.map((row) => (
+              <tr key={row.label} style={{ borderBottom: `1px solid ${T.border}` }}>
+                <td style={{ padding: '8px 16px 8px 32px', color: T.inkSoft }}>{row.label}</td>
+                <td style={{ padding: '8px 16px', fontVariantNumeric: 'tabular-nums', color: T.inkSoft }}>
+                  {row.count}
+                </td>
+              </tr>
+            ))
+          )}
+        </tbody>
+      </table>
+    </section>
+  )
+}
+
 const inputStyle: React.CSSProperties = {
   borderRadius: 10,
   border: `1px solid ${T.border}`,
@@ -161,6 +348,10 @@ export default function Home() {
 
   const [rows, setRows] = useState<CampaignSummary[]>([])
   const [geoOptions, setGeoOptions] = useState<GeoOptions>({ regions: [], countriesByRegion: {} })
+  const [leadsAttribution, setLeadsAttribution] = useState<LeadsAttributionSummary>(EMPTY_LEADS_ATTRIBUTION)
+  const [kpis, setKpis] = useState<DealsKpi | null>(null)
+  const [previousRows, setPreviousRows] = useState<CampaignSummary[] | null>(null)
+  const [previousKpis, setPreviousKpis] = useState<DealsKpi | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
@@ -168,33 +359,55 @@ export default function Home() {
   useEffect(() => {
     const controller = new AbortController()
 
+    function buildParams(periodFrom: string, periodTo: string): URLSearchParams {
+      const params = new URLSearchParams()
+      if (periodFrom) {
+        params.set('from', periodFrom)
+        params.set('leadsFrom', localDayBoundaryToIso(periodFrom, false))
+      }
+      if (periodTo) {
+        params.set('to', periodTo)
+        params.set('leadsTo', localDayBoundaryToIso(periodTo, true))
+      }
+      if (platform !== 'all') params.set('platform', platform)
+      if (region !== 'all') params.set('region', region)
+      if (country !== 'all') params.set('country', country)
+      return params
+    }
+
+    async function fetchPeriod(periodFrom: string, periodTo: string) {
+      const params = buildParams(periodFrom, periodTo)
+      const res = await fetch(`/api/paid-media?${params.toString()}`, { signal: controller.signal })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`)
+      return body
+    }
+
     async function load() {
       setLoading(true)
       setError(null)
 
-      const params = new URLSearchParams()
-      if (from) params.set('from', from)
-      if (to) params.set('to', to)
-      if (platform !== 'all') params.set('platform', platform)
-      if (region !== 'all') params.set('region', region)
-      if (country !== 'all') params.set('country', country)
-
       try {
-        const res = await fetch(`/api/paid-media?${params.toString()}`, {
-          signal: controller.signal,
-        })
-        const body = await res.json()
-
-        if (!res.ok) {
-          throw new Error(body.error ?? `HTTP ${res.status}`)
-        }
+        const previousRange = from && to ? previousPeriodRange(from, to) : null
+        const [body, previousBody] = await Promise.all([
+          fetchPeriod(from, to),
+          previousRange ? fetchPeriod(previousRange.prevFrom, previousRange.prevTo) : null,
+        ])
 
         setRows(body.data)
         setGeoOptions(body.meta.geoOptions)
+        setLeadsAttribution(body.meta.leadsAttribution ?? EMPTY_LEADS_ATTRIBUTION)
+        setKpis(body.meta.kpis ?? null)
+        setPreviousRows(previousBody ? previousBody.data : null)
+        setPreviousKpis(previousBody ? previousBody.meta.kpis ?? null : null)
       } catch (err) {
         if (err instanceof Error && err.name === 'AbortError') return
         setError(err instanceof Error ? err.message : 'Erro desconhecido ao buscar dados.')
         setRows([])
+        setLeadsAttribution(EMPTY_LEADS_ATTRIBUTION)
+        setKpis(null)
+        setPreviousRows(null)
+        setPreviousKpis(null)
       } finally {
         setLoading(false)
       }
@@ -213,13 +426,19 @@ export default function Home() {
     return geoOptions.countriesByRegion[region] ?? []
   }, [geoOptions, region])
 
-  const totalsByCurrency = useMemo(() => {
-    const totals: Record<string, number> = {}
-    for (const row of rows) {
-      totals[row.currency] = (totals[row.currency] ?? 0) + row.spend
-    }
-    return totals
-  }, [rows])
+  const currentAgg = useMemo(() => aggregateByCurrency(rows), [rows])
+  const previousAgg = useMemo(() => (previousRows ? aggregateByCurrency(previousRows) : null), [previousRows])
+
+  const currencies = useMemo(
+    () => (Object.keys(currentAgg.spend).length > 0 ? Object.keys(currentAgg.spend).sort() : ['USD']),
+    [currentAgg]
+  )
+
+  const validationRate = (leadsTotal: number, validatedDeals: number): number | null =>
+    leadsTotal > 0 ? (validatedDeals / leadsTotal) * 100 : null
+
+  const currentValidationRate = kpis ? validationRate(kpis.leadsTotal, kpis.validatedDeals) : null
+  const previousValidationRate = previousKpis ? validationRate(previousKpis.leadsTotal, previousKpis.validatedDeals) : null
 
   const sortedRows = useMemo(() => {
     const copy = [...rows]
@@ -347,25 +566,74 @@ export default function Home() {
           <>
             <section
               style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                display: 'flex',
+                flexWrap: 'wrap',
                 gap: 16,
                 marginBottom: 24,
               }}
             >
-              {Object.entries(totalsByCurrency).length === 0 ? (
-                <SummaryCard label={t('summary.totalUsd')} value={0} currency="USD" index={0} />
-              ) : (
-                Object.entries(totalsByCurrency).map(([currency, value], i) => (
+              {currencies.map((curr, i) => (
+                <SummaryCard
+                  key={`spend-${curr}`}
+                  label={curr === 'USD' ? t('summary.totalUsd') : curr === 'ARS' ? t('summary.totalArs') : `Total ${curr}`}
+                  value={currentAgg.spend[curr] ?? 0}
+                  formatValue={(v) => formatCurrency(v, curr)}
+                  glowColor={CURRENCY_COLOR[curr] ?? ACCENT.teal}
+                  changePct={previousAgg ? pctChange(currentAgg.spend[curr] ?? 0, previousAgg.spend[curr] ?? 0) : null}
+                  index={i}
+                />
+              ))}
+
+              <SummaryCard
+                label={t('summary.leads')}
+                value={kpis?.leadsTotal ?? 0}
+                formatValue={(v) => Math.round(v).toLocaleString('pt-BR')}
+                glowColor={ACCENT.teal}
+                changePct={previousKpis ? pctChange(kpis?.leadsTotal ?? 0, previousKpis.leadsTotal) : null}
+                index={currencies.length}
+              />
+
+              {currencies.map((curr, i) => {
+                const leadsForCurrency = currentAgg.leads[curr] ?? 0
+                const spendForCurrency = currentAgg.spend[curr] ?? 0
+                const cplValue = leadsForCurrency > 0 ? spendForCurrency / leadsForCurrency : 0
+                const prevLeads = previousAgg?.leads[curr] ?? 0
+                const prevSpend = previousAgg?.spend[curr] ?? 0
+                const prevCpl = prevLeads > 0 ? prevSpend / prevLeads : null
+                return (
                   <SummaryCard
-                    key={currency}
-                    label={currency === 'USD' ? t('summary.totalUsd') : currency === 'ARS' ? t('summary.totalArs') : `Total ${currency}`}
-                    value={value}
-                    currency={currency}
-                    index={i}
+                    key={`cpl-${curr}`}
+                    label={`${t('summary.cplAvg')} ${curr}`}
+                    value={cplValue}
+                    formatValue={(v) => formatNumber(v)}
+                    glowColor={CURRENCY_COLOR[curr] ?? ACCENT.teal}
+                    changePct={previousAgg ? pctChange(cplValue, prevCpl) : null}
+                    index={currencies.length + 1 + i}
                   />
-                ))
-              )}
+                )
+              })}
+
+              <SummaryCard
+                label={t('summary.validatedDeals')}
+                value={kpis?.validatedDeals ?? 0}
+                formatValue={(v) => Math.round(v).toLocaleString('pt-BR')}
+                glowColor={ACCENT.purple}
+                changePct={previousKpis ? pctChange(kpis?.validatedDeals ?? 0, previousKpis.validatedDeals) : null}
+                index={2 * currencies.length + 1}
+              />
+
+              <SummaryCard
+                label={t('summary.validationRate')}
+                value={currentValidationRate ?? 0}
+                formatValue={(v) => `${v.toFixed(1)}%`}
+                glowColor={ACCENT.cyanDim}
+                changePct={
+                  currentValidationRate !== null && previousValidationRate !== null
+                    ? pctChange(currentValidationRate, previousValidationRate)
+                    : null
+                }
+                index={2 * currencies.length + 2}
+              />
             </section>
 
             <section
@@ -380,11 +648,12 @@ export default function Home() {
               <table style={{ width: '100%', minWidth: 720, textAlign: 'left', fontSize: 13, borderCollapse: 'collapse' }}>
                 <thead>
                   <tr style={{ borderBottom: `1px solid ${T.border}`, color: T.inkFaint }}>
-                    <th style={{ padding: '10px 16px' }}>{t('table.platform')}</th>
-                    <th style={{ padding: '10px 16px' }}>{t('table.campaign')}</th>
                     <th style={{ padding: '10px 16px' }}>{t('table.currency')}</th>
                     <th style={{ padding: '10px 16px' }}>{t('table.region')}</th>
-                    <th style={{ padding: '10px 16px' }}>{t('table.countries')}</th>
+                    <th style={{ padding: '10px 16px' }}>{t('table.platform')}</th>
+                    <th style={{ padding: '10px 16px' }}>{t('table.campaign')}</th>
+                    <th style={{ padding: '10px 16px' }}>{t('table.leads')}</th>
+                    <th style={{ padding: '10px 16px' }}>{t('table.cpl')}</th>
                     <th
                       style={{ padding: '10px 16px', cursor: 'pointer', userSelect: 'none' }}
                       onClick={() => setSortDirection((d) => (d === 'desc' ? 'asc' : 'desc'))}
@@ -396,13 +665,29 @@ export default function Home() {
                 <tbody>
                   {sortedRows.length === 0 ? (
                     <tr>
-                      <td colSpan={6} style={{ padding: '24px 16px', textAlign: 'center', color: T.inkFaint }}>
+                      <td colSpan={7} style={{ padding: '24px 16px', textAlign: 'center', color: T.inkFaint }}>
                         {t('table.empty')}
                       </td>
                     </tr>
                   ) : (
                     sortedRows.map((row) => (
                       <tr key={`${row.campaign_id}-${row.currency}`} style={{ borderBottom: `1px solid ${T.border}` }}>
+                        <td style={{ padding: '10px 16px' }}>
+                          <span
+                            style={{
+                              fontSize: 11,
+                              fontWeight: 700,
+                              letterSpacing: 0.4,
+                              color: CURRENCY_COLOR[row.currency] ?? T.inkSoft,
+                              border: `1px solid ${(CURRENCY_COLOR[row.currency] ?? T.inkFaint)}55`,
+                              borderRadius: 6,
+                              padding: '2px 6px',
+                            }}
+                          >
+                            {row.currency}
+                          </span>
+                        </td>
+                        <td style={{ padding: '10px 16px', color: T.inkSoft }}>{row.region ?? '—'}</td>
                         <td style={{ padding: '10px 16px' }}>
                           <span
                             style={{
@@ -425,27 +710,12 @@ export default function Home() {
                           </span>
                         </td>
                         <td style={{ padding: '10px 16px' }}>{row.campaign_name}</td>
-                        <td style={{ padding: '10px 16px' }}>
-                          <span
-                            style={{
-                              fontSize: 11,
-                              fontWeight: 700,
-                              letterSpacing: 0.4,
-                              color: CURRENCY_COLOR[row.currency] ?? T.inkSoft,
-                              border: `1px solid ${(CURRENCY_COLOR[row.currency] ?? T.inkFaint)}55`,
-                              borderRadius: 6,
-                              padding: '2px 6px',
-                            }}
-                          >
-                            {row.currency}
-                          </span>
-                        </td>
-                        <td style={{ padding: '10px 16px', color: T.inkSoft }}>{row.region ?? '—'}</td>
-                        <td style={{ padding: '10px 16px', color: T.inkSoft }}>
-                          {row.countries.length > 0 ? row.countries.join(', ') : '—'}
+                        <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>{row.leads}</td>
+                        <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+                          {row.cpl !== null ? formatNumber(row.cpl) : '—'}
                         </td>
                         <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
-                          {formatCurrency(row.spend, row.currency)}
+                          {formatNumber(row.spend)}
                         </td>
                       </tr>
                     ))
@@ -453,6 +723,8 @@ export default function Home() {
                 </tbody>
               </table>
             </section>
+
+            <LeadsAttributionSection leadsAttribution={leadsAttribution} t={t} />
           </>
         )}
       </main>
