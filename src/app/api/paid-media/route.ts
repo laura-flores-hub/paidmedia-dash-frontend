@@ -274,7 +274,17 @@ const FETCHERS: Record<Platform, typeof fetchGoogle> = {
 }
 
 function normalize(value: string | null | undefined): string {
-  return (value ?? '').trim().toLowerCase()
+  const raw = value ?? ''
+  // Campaign names arriving via UTM params are URL-encoded (e.g. "%2B",
+  // "%5B") — without decoding, a name-based lookup never matches the plain
+  // campaign_name stored in validation_ads_campaign_keys_v2.
+  let decoded = raw
+  try {
+    decoded = decodeURIComponent(raw)
+  } catch {
+    // Malformed encoding — fall back to the raw value rather than throwing.
+  }
+  return decoded.trim().toLowerCase()
 }
 
 // Maps a HubSpot form's utm_source to one of the ad platforms this dashboard
@@ -475,8 +485,15 @@ async function fetchLeadsAttribution(from: string | null, to: string | null): Pr
     }
 
     const hsaCam = (row.forms_hsa_cam ?? '').trim()
+    const platform = platformFromUtmSource(row.forms_hs_utm_source)
 
-    if (hsaCam) {
+    // forms_hsa_cam mirrors HubSpot's native Facebook ad-click auto-tagging
+    // (hsa_acc/hsa_cam/hsa_grp/hsa_ad/hsa_src) and reliably holds the real
+    // campaign_id for Meta and Google leads — but for LinkedIn the pipeline
+    // populates the same column with something else entirely (verified: 0/10
+    // sampled values matched any real campaign_id in data_linkedin_v2). For
+    // LinkedIn, always resolve via the campaign-name lookup below instead.
+    if (hsaCam && platform !== 'linkedin') {
       bump(leadsByCampaignId, hsaCam)
       if (flags.isSql) bump(sqlsByCampaignId, hsaCam)
       if (flags.isOpportunity) bump(opportunitiesByCampaignId, hsaCam)
@@ -487,7 +504,6 @@ async function fetchLeadsAttribution(from: string | null, to: string | null): Pr
       continue
     }
 
-    const platform = platformFromUtmSource(row.forms_hs_utm_source)
     if (platform) {
       const lookupKey = campaignKeyLookupKey(platform, row.forms_hs_utm_campaign ?? '')
       const resolvedId = campaignKeyMap.get(lookupKey)
