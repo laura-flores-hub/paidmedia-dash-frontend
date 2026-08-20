@@ -9,7 +9,7 @@ const roboto = Roboto({
 });
 
 export const metadata: Metadata = {
-  title: "Paid Media Dashboard",
+  title: "Inbound Dashboard",
   description: "Dashboard de spend em paid media (Google, Meta, LinkedIn)",
 };
 

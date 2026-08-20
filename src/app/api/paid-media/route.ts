@@ -8,6 +8,9 @@ import type {
   OrganicChannel,
   LeadsAttributionSummary,
   ChannelBreakdownEntry,
+  InboundOverview,
+  OverviewCategory,
+  StageBreakdown,
 } from '@/types/paid-media'
 
 const PLATFORMS: Platform[] = ['google', 'meta', 'linkedin']
@@ -358,6 +361,45 @@ function campaignKeyLookupKey(platform: Platform, campaignName: string): string 
   return `${platform}::${normalize(campaignName)}`
 }
 
+// A deal's meeting can get validated long after the underlying lead was
+// submitted (weeks/months, in practice) — restricting contact→campaign
+// resolution to the currently selected date window meant most validated
+// deals could never be traced back to a campaign, since their lead fell
+// outside that window. This resolves every contact's campaign from the
+// full lead history instead, independent of any date filter, specifically
+// for that lookup (lead/SQL counts by period still use the windowed rows).
+async function fetchAllTimeContactToCampaignId(): Promise<Map<string, string>> {
+  const [leadRows, campaignKeyRows] = await Promise.all([
+    withCache('lead-form-rows::all-time', () => fetchLeadFormRows(null, null)),
+    withCache('campaign-key-rows', fetchCampaignKeyRows),
+  ])
+
+  const campaignKeyMap = new Map<string, string>()
+  for (const row of campaignKeyRows) {
+    campaignKeyMap.set(campaignKeyLookupKey(row.platform.toLowerCase() as Platform, row.campaign_name), row.campaign_id)
+  }
+
+  const contactToCampaignId = new Map<string, string>()
+  for (const row of leadRows) {
+    if (!row.contact_id || contactToCampaignId.has(row.contact_id)) continue
+
+    const hsaCam = (row.forms_hsa_cam ?? '').trim()
+    const platform = platformFromUtmSource(row.forms_hs_utm_source)
+
+    if (hsaCam && platform !== 'linkedin') {
+      contactToCampaignId.set(row.contact_id, hsaCam)
+      continue
+    }
+
+    if (platform) {
+      const resolvedId = campaignKeyMap.get(campaignKeyLookupKey(platform, row.forms_hs_utm_campaign ?? ''))
+      if (resolvedId) contactToCampaignId.set(row.contact_id, resolvedId)
+    }
+  }
+
+  return contactToCampaignId
+}
+
 // data_hs_contacts_v2 is 800k+ rows — never read it unfiltered. Only the
 // contact_ids that actually show up in this request's lead rows are looked
 // up, in indexed `hs_object_id IN (...)` chunks (same pattern as the geo
@@ -539,14 +581,18 @@ type DealRow = {
   hs_object_id: string
   contact_ids: string[] | null
   first_meeting_status: string | null
+  dealstage: string | null
 }
 
 const VALIDATED_MEETING_STATUS = 'Validated'
+const DISQUALIFIED_MEETING_STATUS = 'No Fit'
 
 async function fetchDealRows(leadsFrom: string | null, leadsTo: string | null): Promise<DealRow[]> {
   const supabase = getSupabaseClient()
   return fetchAllRows<DealRow>(() => {
-    let query = supabase.from('data_hs_deals_v2').select('hs_object_id, contact_ids, first_meeting_status, createdate')
+    let query = supabase
+      .from('data_hs_deals_v2')
+      .select('hs_object_id, contact_ids, first_meeting_status, dealstage, createdate')
     if (leadsFrom) query = query.gte('createdate', leadsFrom)
     if (leadsTo) query = query.lte('createdate', leadsTo)
     return query
@@ -579,6 +625,119 @@ function computeDealsKpi(
   return { leadsTotal, validatedDeals }
 }
 
+type OverviewContactRow = {
+  hs_object_id: string
+  lifecyclestage: string | null
+  not_qualified_reason: string | null
+  createdate: string
+}
+
+// data_hs_contacts_v2 is 800k+ rows. `createdate` is indexed (a plain range
+// filter on it stays fast, ~1-2s/page), but `region` doesn't appear to be —
+// filtering on both together routinely blows the Postgres statement timeout.
+// So this only ever filters by createdate at the DB level (cached once per
+// date range and shared across every region tab) and filters by region
+// afterwards, in memory.
+async function fetchContactsInDateRange(
+  leadsFrom: string | null,
+  leadsTo: string | null
+): Promise<(OverviewContactRow & { region: string | null })[]> {
+  const supabase = getSupabaseClient()
+  return fetchAllRows<OverviewContactRow & { region: string | null }>(() => {
+    let query = supabase
+      .from('data_hs_contacts_v2')
+      .select('hs_object_id, region, lifecyclestage, not_qualified_reason, createdate')
+    if (leadsFrom) query = query.gte('createdate', leadsFrom)
+    if (leadsTo) query = query.lte('createdate', leadsTo)
+    return query
+  }, 'data_hs_contacts_v2')
+}
+
+async function fetchOverviewContacts(
+  region: string,
+  leadsFrom: string | null,
+  leadsTo: string | null
+): Promise<OverviewContactRow[]> {
+  const rows = await withCache(`contacts-in-range::${leadsFrom}::${leadsTo}`, () =>
+    fetchContactsInDateRange(leadsFrom, leadsTo)
+  )
+  return rows.filter((row) => normalizeContactRegion(row.region) === region)
+}
+
+// A deal's stage decides whether it's still open ("active"), lost, or won —
+// matched by keyword rather than an exact list because stage labels vary per
+// pipeline (BDRs, Partnerships, Revenue Expansions, ...) and carry emoji
+// suffixes (e.g. "Lost ♻️", "Postponed ⏱️").
+const LOST_STAGE_PATTERN = /lost|recycling|postponed|churned/i
+const WON_STAGE_PATTERN = /won/i
+
+function dealStageBucket(dealstage: string | null): 'lost' | 'won' | 'active' {
+  if (dealstage && LOST_STAGE_PATTERN.test(dealstage)) return 'lost'
+  if (dealstage && WON_STAGE_PATTERN.test(dealstage)) return 'won'
+  return 'active'
+}
+
+function emptyOverviewCategory(): OverviewCategory {
+  return { total: 0, byLifecycleStage: {}, byDealStage: {} }
+}
+
+function addToBreakdown(breakdown: StageBreakdown, key: string) {
+  breakdown[key] = (breakdown[key] ?? 0) + 1
+}
+
+function addToCategory(category: OverviewCategory, lifecyclestage: string | null, dealstage: string | null) {
+  category.total += 1
+  addToBreakdown(category.byLifecycleStage, lifecyclestage?.trim() || 'sem lifecycle')
+  addToBreakdown(category.byDealStage, dealstage?.trim() || 'sem deal')
+}
+
+// Classifies each contact into exactly one of disqualified/lost/active
+// (contacts with no deal, or only a won deal, land in none of the three —
+// "won" isn't one of the requested Overview buckets) — and independently
+// flags whether they ever reached SQL, using the same lifecycle-stage
+// resolution as the rest of the dashboard.
+function computeInboundOverview(contacts: OverviewContactRow[], dealRows: DealRow[]): InboundOverview {
+  const dealsByContactId = new Map<string, DealRow[]>()
+  for (const deal of dealRows) {
+    for (const contactId of deal.contact_ids ?? []) {
+      const list = dealsByContactId.get(contactId)
+      if (list) list.push(deal)
+      else dealsByContactId.set(contactId, [deal])
+    }
+  }
+
+  const active = emptyOverviewCategory()
+  const validated = emptyOverviewCategory()
+  const lost = emptyOverviewCategory()
+  const disqualified = emptyOverviewCategory()
+
+  for (const contact of contacts) {
+    const deals = dealsByContactId.get(contact.hs_object_id) ?? []
+
+    const isDisqualified =
+      Boolean(contact.not_qualified_reason?.trim()) ||
+      deals.some((d) => d.first_meeting_status === DISQUALIFIED_MEETING_STATUS)
+
+    const activeDeal = deals.find((d) => dealStageBucket(d.dealstage) === 'active')
+    const lostDeal = deals.find((d) => dealStageBucket(d.dealstage) === 'lost')
+    const disqualifyingDeal = deals.find((d) => d.first_meeting_status === DISQUALIFIED_MEETING_STATUS)
+
+    if (isDisqualified) {
+      addToCategory(disqualified, contact.lifecyclestage, disqualifyingDeal?.dealstage ?? null)
+    } else if (activeDeal) {
+      addToCategory(active, contact.lifecyclestage, activeDeal.dealstage)
+    } else if (lostDeal) {
+      addToCategory(lost, contact.lifecyclestage, lostDeal.dealstage)
+    }
+
+    if (lifecycleFlags(contact.lifecyclestage).isSql) {
+      addToCategory(validated, contact.lifecyclestage, deals[0]?.dealstage ?? null)
+    }
+  }
+
+  return { totalContacts: contacts.length, active, validated, lost, disqualified }
+}
+
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams
   const from = searchParams.get('from')
@@ -605,17 +764,25 @@ export async function GET(request: NextRequest) {
 
   const platformsToFetch: Platform[] = platformParam ? [platformParam as Platform] : PLATFORMS
 
+  // The Overview ("View" = general) screen additionally needs contacts —
+  // only fetched when no specific platform is selected, since it's a
+  // separate, more expensive query against the 800k-row contacts table.
+  const wantsOverview = !platformParam && Boolean(regionParam)
+
   try {
-    const [spendResults, currencyMap, leads, dealRows] = await Promise.all([
-      Promise.all(
-        platformsToFetch.map((platform) =>
-          withCache(`spend::${platform}::${from}::${to}`, () => FETCHERS[platform](from, to))
-        )
-      ),
-      fetchCurrencyMap(),
-      fetchLeadsAttribution(leadsFrom, leadsTo),
-      withCache(`deal-rows::${leadsFrom}::${leadsTo}`, () => fetchDealRows(leadsFrom, leadsTo)),
-    ])
+    const [spendResults, currencyMap, leads, dealRows, overviewContacts, allTimeContactToCampaignId] =
+      await Promise.all([
+        Promise.all(
+          platformsToFetch.map((platform) =>
+            withCache(`spend::${platform}::${from}::${to}`, () => FETCHERS[platform](from, to))
+          )
+        ),
+        fetchCurrencyMap(),
+        fetchLeadsAttribution(leadsFrom, leadsTo),
+        withCache(`deal-rows::${leadsFrom}::${leadsTo}`, () => fetchDealRows(leadsFrom, leadsTo)),
+        wantsOverview ? fetchOverviewContacts(regionParam as string, leadsFrom, leadsTo) : Promise.resolve(null),
+        withCache('contact-to-campaign::all-time', fetchAllTimeContactToCampaignId),
+      ])
     const rawRows = spendResults.flat()
     const campaignIds = [...new Set(rawRows.map((row) => row.campaign_id))]
     const geo = await fetchGeoBridge(campaignIds)
@@ -685,7 +852,7 @@ export async function GET(request: NextRequest) {
 
     const filteredCampaignIds = new Set(data.map((row) => row.campaign_id))
     const leadsTotal = data.reduce((sum, row) => sum + row.leads, 0)
-    const kpis = computeDealsKpi(dealRows, leads.contactToCampaignId, filteredCampaignIds, leadsTotal)
+    const kpis = computeDealsKpi(dealRows, allTimeContactToCampaignId, filteredCampaignIds, leadsTotal)
 
     // Unattributed/organic leads have no campaign_id, so region comes from
     // the HubSpot contact instead (resolved in fetchLeadsAttribution) — a
@@ -736,6 +903,8 @@ export async function GET(request: NextRequest) {
       },
     }
 
+    const overview = overviewContacts ? computeInboundOverview(overviewContacts, dealRows) : null
+
     return NextResponse.json({
       data,
       meta: {
@@ -748,6 +917,7 @@ export async function GET(request: NextRequest) {
         geoOptions: geo.geoOptions,
         leadsAttribution,
         kpis,
+        overview,
       },
     })
   } catch (error) {

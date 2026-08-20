@@ -74,6 +74,22 @@ export type DealsKpi = {
   validatedDeals: number
 }
 
+export type StageBreakdown = Record<string, number>
+
+export type OverviewCategory = {
+  total: number
+  byLifecycleStage: StageBreakdown
+  byDealStage: StageBreakdown
+}
+
+export type InboundOverview = {
+  totalContacts: number
+  active: OverviewCategory
+  validated: OverviewCategory
+  lost: OverviewCategory
+  disqualified: OverviewCategory
+}
+
 export type PaidMediaResponse = {
   data: CampaignSummary[]
   meta: {
@@ -86,6 +102,7 @@ export type PaidMediaResponse = {
     geoOptions: GeoOptions
     leadsAttribution: LeadsAttributionSummary
     kpis: DealsKpi
+    overview: InboundOverview | null
   }
 }
 
