@@ -27,12 +27,8 @@ const ORGANIC_CHANNELS: OrganicChannel[] = [
 ]
 
 const EMPTY_LEADS_ATTRIBUTION: LeadsAttributionSummary = {
-  unattributedPaid: { total: 0, byPlatform: {} },
-  organic: { total: 0, byChannel: {} },
-}
-
-function formatCurrency(value: number, currency: string) {
-  return `${currency} ${value.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  unattributedPaid: { total: 0, totalSql: 0, totalOpportunity: 0, totalCustomer: 0, byPlatform: {} },
+  organic: { total: 0, totalSql: 0, totalOpportunity: 0, totalCustomer: 0, byChannel: {} },
 }
 
 function formatNumber(value: number) {
@@ -245,14 +241,16 @@ function LeadsAttributionSection({
   leadsAttribution: LeadsAttributionSummary
   t: (key: TranslationKey) => string
 }) {
+  const emptyEntry = { leads: 0, sql: 0, opportunity: 0, customer: 0 }
+
   const platformRows = PLATFORM_OPTIONS.filter((p): p is Platform => p !== 'all')
-    .map((p) => ({ label: PLATFORM_LABELS[p], count: leadsAttribution.unattributedPaid.byPlatform[p] ?? 0 }))
-    .filter((r) => r.count > 0)
+    .map((p) => ({ label: PLATFORM_LABELS[p], ...(leadsAttribution.unattributedPaid.byPlatform[p] ?? emptyEntry) }))
+    .filter((r) => r.leads > 0)
 
   const organicRows = ORGANIC_CHANNELS.map((channel) => ({
     label: t(`channel.${channel}` as TranslationKey),
-    count: leadsAttribution.organic.byChannel[channel] ?? 0,
-  })).filter((r) => r.count > 0)
+    ...(leadsAttribution.organic.byChannel[channel] ?? emptyEntry),
+  })).filter((r) => r.leads > 0)
 
   return (
     <section
@@ -273,6 +271,9 @@ function LeadsAttributionSection({
           <tr style={{ borderBottom: `1px solid ${T.border}`, color: T.inkFaint }}>
             <th style={{ padding: '10px 16px' }}>{t('leadsAttribution.category')}</th>
             <th style={{ padding: '10px 16px' }}>{t('leadsAttribution.leads')}</th>
+            <th style={{ padding: '10px 16px' }}>{t('leadsAttribution.sql')}</th>
+            <th style={{ padding: '10px 16px' }}>{t('leadsAttribution.opportunity')}</th>
+            <th style={{ padding: '10px 16px' }}>{t('leadsAttribution.customer')}</th>
           </tr>
         </thead>
         <tbody>
@@ -281,10 +282,19 @@ function LeadsAttributionSection({
             <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
               {leadsAttribution.unattributedPaid.total}
             </td>
+            <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+              {leadsAttribution.unattributedPaid.totalSql}
+            </td>
+            <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+              {leadsAttribution.unattributedPaid.totalOpportunity}
+            </td>
+            <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+              {leadsAttribution.unattributedPaid.totalCustomer}
+            </td>
           </tr>
           {platformRows.length === 0 ? (
             <tr style={{ borderBottom: `1px solid ${T.border}` }}>
-              <td colSpan={2} style={{ padding: '8px 16px 8px 32px', color: T.inkFaint }}>
+              <td colSpan={5} style={{ padding: '8px 16px 8px 32px', color: T.inkFaint }}>
                 {t('leadsAttribution.empty')}
               </td>
             </tr>
@@ -293,7 +303,16 @@ function LeadsAttributionSection({
               <tr key={row.label} style={{ borderBottom: `1px solid ${T.border}` }}>
                 <td style={{ padding: '8px 16px 8px 32px', color: T.inkSoft }}>{row.label}</td>
                 <td style={{ padding: '8px 16px', fontVariantNumeric: 'tabular-nums', color: T.inkSoft }}>
-                  {row.count}
+                  {row.leads}
+                </td>
+                <td style={{ padding: '8px 16px', fontVariantNumeric: 'tabular-nums', color: T.inkSoft }}>
+                  {row.sql}
+                </td>
+                <td style={{ padding: '8px 16px', fontVariantNumeric: 'tabular-nums', color: T.inkSoft }}>
+                  {row.opportunity}
+                </td>
+                <td style={{ padding: '8px 16px', fontVariantNumeric: 'tabular-nums', color: T.inkSoft }}>
+                  {row.customer}
                 </td>
               </tr>
             ))
@@ -304,10 +323,19 @@ function LeadsAttributionSection({
             <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
               {leadsAttribution.organic.total}
             </td>
+            <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+              {leadsAttribution.organic.totalSql}
+            </td>
+            <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+              {leadsAttribution.organic.totalOpportunity}
+            </td>
+            <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+              {leadsAttribution.organic.totalCustomer}
+            </td>
           </tr>
           {organicRows.length === 0 ? (
             <tr>
-              <td colSpan={2} style={{ padding: '8px 16px 8px 32px', color: T.inkFaint }}>
+              <td colSpan={5} style={{ padding: '8px 16px 8px 32px', color: T.inkFaint }}>
                 {t('leadsAttribution.empty')}
               </td>
             </tr>
@@ -316,7 +344,16 @@ function LeadsAttributionSection({
               <tr key={row.label} style={{ borderBottom: `1px solid ${T.border}` }}>
                 <td style={{ padding: '8px 16px 8px 32px', color: T.inkSoft }}>{row.label}</td>
                 <td style={{ padding: '8px 16px', fontVariantNumeric: 'tabular-nums', color: T.inkSoft }}>
-                  {row.count}
+                  {row.leads}
+                </td>
+                <td style={{ padding: '8px 16px', fontVariantNumeric: 'tabular-nums', color: T.inkSoft }}>
+                  {row.sql}
+                </td>
+                <td style={{ padding: '8px 16px', fontVariantNumeric: 'tabular-nums', color: T.inkSoft }}>
+                  {row.opportunity}
+                </td>
+                <td style={{ padding: '8px 16px', fontVariantNumeric: 'tabular-nums', color: T.inkSoft }}>
+                  {row.customer}
                 </td>
               </tr>
             ))
@@ -572,25 +609,13 @@ export default function Home() {
                 marginBottom: 24,
               }}
             >
-              {currencies.map((curr, i) => (
-                <SummaryCard
-                  key={`spend-${curr}`}
-                  label={curr === 'USD' ? t('summary.totalUsd') : curr === 'ARS' ? t('summary.totalArs') : `Total ${curr}`}
-                  value={currentAgg.spend[curr] ?? 0}
-                  formatValue={(v) => formatCurrency(v, curr)}
-                  glowColor={CURRENCY_COLOR[curr] ?? ACCENT.teal}
-                  changePct={previousAgg ? pctChange(currentAgg.spend[curr] ?? 0, previousAgg.spend[curr] ?? 0) : null}
-                  index={i}
-                />
-              ))}
-
               <SummaryCard
                 label={t('summary.leads')}
                 value={kpis?.leadsTotal ?? 0}
                 formatValue={(v) => Math.round(v).toLocaleString('pt-BR')}
                 glowColor={ACCENT.teal}
                 changePct={previousKpis ? pctChange(kpis?.leadsTotal ?? 0, previousKpis.leadsTotal) : null}
-                index={currencies.length}
+                index={0}
               />
 
               {currencies.map((curr, i) => {
@@ -608,7 +633,7 @@ export default function Home() {
                     formatValue={(v) => formatNumber(v)}
                     glowColor={CURRENCY_COLOR[curr] ?? ACCENT.teal}
                     changePct={previousAgg ? pctChange(cplValue, prevCpl) : null}
-                    index={currencies.length + 1 + i}
+                    index={1 + i}
                   />
                 )
               })}
@@ -619,7 +644,7 @@ export default function Home() {
                 formatValue={(v) => Math.round(v).toLocaleString('pt-BR')}
                 glowColor={ACCENT.purple}
                 changePct={previousKpis ? pctChange(kpis?.validatedDeals ?? 0, previousKpis.validatedDeals) : null}
-                index={2 * currencies.length + 1}
+                index={currencies.length + 1}
               />
 
               <SummaryCard
@@ -632,7 +657,7 @@ export default function Home() {
                     ? pctChange(currentValidationRate, previousValidationRate)
                     : null
                 }
-                index={2 * currencies.length + 2}
+                index={currencies.length + 2}
               />
             </section>
 
@@ -654,6 +679,12 @@ export default function Home() {
                     <th style={{ padding: '10px 16px' }}>{t('table.campaign')}</th>
                     <th style={{ padding: '10px 16px' }}>{t('table.leads')}</th>
                     <th style={{ padding: '10px 16px' }}>{t('table.cpl')}</th>
+                    <th style={{ padding: '10px 16px' }}>{t('table.sql')}</th>
+                    <th style={{ padding: '10px 16px' }}>{t('table.cpsql')}</th>
+                    <th style={{ padding: '10px 16px' }}>{t('table.opportunity')}</th>
+                    <th style={{ padding: '10px 16px' }}>{t('table.cpopportunity')}</th>
+                    <th style={{ padding: '10px 16px' }}>{t('table.customer')}</th>
+                    <th style={{ padding: '10px 16px' }}>{t('table.cpcustomer')}</th>
                     <th
                       style={{ padding: '10px 16px', cursor: 'pointer', userSelect: 'none' }}
                       onClick={() => setSortDirection((d) => (d === 'desc' ? 'asc' : 'desc'))}
@@ -665,7 +696,7 @@ export default function Home() {
                 <tbody>
                   {sortedRows.length === 0 ? (
                     <tr>
-                      <td colSpan={7} style={{ padding: '24px 16px', textAlign: 'center', color: T.inkFaint }}>
+                      <td colSpan={13} style={{ padding: '24px 16px', textAlign: 'center', color: T.inkFaint }}>
                         {t('table.empty')}
                       </td>
                     </tr>
@@ -713,6 +744,18 @@ export default function Home() {
                         <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>{row.leads}</td>
                         <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
                           {row.cpl !== null ? formatNumber(row.cpl) : '—'}
+                        </td>
+                        <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>{row.sql}</td>
+                        <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+                          {row.cpsql !== null ? formatNumber(row.cpsql) : '—'}
+                        </td>
+                        <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>{row.opportunity}</td>
+                        <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+                          {row.cpopportunity !== null ? formatNumber(row.cpopportunity) : '—'}
+                        </td>
+                        <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>{row.customer}</td>
+                        <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
+                          {row.cpcustomer !== null ? formatNumber(row.cpcustomer) : '—'}
                         </td>
                         <td style={{ padding: '10px 16px', fontVariantNumeric: 'tabular-nums' }}>
                           {formatNumber(row.spend)}

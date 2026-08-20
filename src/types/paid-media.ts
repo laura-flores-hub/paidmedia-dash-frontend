@@ -19,6 +19,12 @@ export type CampaignSummary = {
   countries: string[]
   leads: number
   cpl: number | null
+  sql: number
+  cpsql: number | null
+  opportunity: number
+  cpopportunity: number | null
+  customer: number
+  cpcustomer: number | null
 }
 
 export type GeoOptions = {
@@ -35,14 +41,27 @@ export type OrganicChannel =
   | 'trafego_direto'
   | 'outros'
 
+export type ChannelBreakdownEntry = {
+  leads: number
+  sql: number
+  opportunity: number
+  customer: number
+}
+
 export type UnattributedBreakdown = {
   total: number
-  byPlatform: Partial<Record<Platform, number>>
+  totalSql: number
+  totalOpportunity: number
+  totalCustomer: number
+  byPlatform: Partial<Record<Platform, ChannelBreakdownEntry>>
 }
 
 export type OrganicBreakdown = {
   total: number
-  byChannel: Partial<Record<OrganicChannel, number>>
+  totalSql: number
+  totalOpportunity: number
+  totalCustomer: number
+  byChannel: Partial<Record<OrganicChannel, ChannelBreakdownEntry>>
 }
 
 export type LeadsAttributionSummary = {

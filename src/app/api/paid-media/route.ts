@@ -7,6 +7,7 @@ import type {
   GeoOptions,
   OrganicChannel,
   LeadsAttributionSummary,
+  ChannelBreakdownEntry,
 } from '@/types/paid-media'
 
 const PLATFORMS: Platform[] = ['google', 'meta', 'linkedin']
@@ -347,10 +348,93 @@ function campaignKeyLookupKey(platform: Platform, campaignName: string): string 
   return `${platform}::${normalize(campaignName)}`
 }
 
+// data_hs_contacts_v2 is 800k+ rows — never read it unfiltered. Only the
+// contact_ids that actually show up in this request's lead rows are looked
+// up, in indexed `hs_object_id IN (...)` chunks (same pattern as the geo
+// bridge lookup above).
+const CONTACT_CHUNK_SIZE = 150
+const CONTACT_CONCURRENCY = 4
+
+type ContactInfoRow = { hs_object_id: string; region: string | null; lifecyclestage: string | null }
+
+async function fetchContactInfoChunk(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  ids: string[],
+  attempt = 1
+): Promise<ContactInfoRow[]> {
+  const { data, error } = await supabase
+    .from('data_hs_contacts_v2')
+    .select('hs_object_id, region, lifecyclestage')
+    .in('hs_object_id', ids)
+
+  if (error) {
+    if (attempt < 3) return fetchContactInfoChunk(supabase, ids, attempt + 1)
+    throw new Error(`Falha ao consultar data_hs_contacts_v2 no Supabase: ${error.message}`)
+  }
+
+  return data ?? []
+}
+
+// The contact's `region` field already uses the same taxonomy as
+// geo_bridge's region_consolidated (HISPAM/Brazil/EMEA/APAC/NA), except for
+// this one label variant.
+function normalizeContactRegion(region: string | null): string | null {
+  if (!region) return null
+  const trimmed = region.trim()
+  return trimmed === 'NA and Caribbean' ? 'NA' : trimmed
+}
+
+// HubSpot's lifecyclestage only ever holds the contact's *current* stage,
+// not history — a contact that has since become an opportunity/customer no
+// longer shows "salesqualifiedlead" even though they passed through it. Each
+// stage below is therefore "reached this stage or later", using the
+// standard HubSpot funnel ordering, or it'd undercount contacts who moved on.
+const LIFECYCLE_STAGE_ORDER = ['lead', 'marketingqualifiedlead', 'salesqualifiedlead', 'opportunity', 'customer']
+
+type LifecycleFlags = { isSql: boolean; isOpportunity: boolean; isCustomer: boolean }
+
+function lifecycleFlags(lifecyclestage: string | null): LifecycleFlags {
+  const stageIndex = lifecyclestage ? LIFECYCLE_STAGE_ORDER.indexOf(lifecyclestage.trim().toLowerCase()) : -1
+  const reached = (stage: string) => stageIndex >= 0 && stageIndex >= LIFECYCLE_STAGE_ORDER.indexOf(stage)
+  return {
+    isSql: reached('salesqualifiedlead'),
+    isOpportunity: reached('opportunity'),
+    isCustomer: reached('customer'),
+  }
+}
+
+type ContactInfo = { region: string | null } & LifecycleFlags
+
+async function fetchContactInfoMap(contactIds: string[]): Promise<Map<string, ContactInfo>> {
+  const map = new Map<string, ContactInfo>()
+  if (contactIds.length === 0) return map
+
+  const supabase = getSupabaseClient()
+  const chunks = chunk(contactIds, CONTACT_CHUNK_SIZE)
+  const results = await runWithConcurrency(chunks, CONTACT_CONCURRENCY, (ids) => fetchContactInfoChunk(supabase, ids))
+
+  for (const row of results.flat()) {
+    map.set(row.hs_object_id, { region: normalizeContactRegion(row.region), ...lifecycleFlags(row.lifecyclestage) })
+  }
+  return map
+}
+
+// A lead that couldn't be tied to a specific campaign (paid-unattributed or
+// organic) has no campaign_id, so it can't get a region via the geo bridge —
+// its region (if any) comes from the HubSpot contact instead. Kept as
+// individual records (rather than pre-aggregated) so the region filter can
+// be applied the same way it's applied to campaign rows.
+type UnresolvedLeadRecord =
+  | ({ kind: 'unattributedPaid'; platform: Platform; region: string | null } & LifecycleFlags)
+  | ({ kind: 'organic'; channel: OrganicChannel; region: string | null } & LifecycleFlags)
+
 type LeadsAttributionResult = {
   leadsByCampaignId: Map<string, number>
+  sqlsByCampaignId: Map<string, number>
+  opportunitiesByCampaignId: Map<string, number>
+  customersByCampaignId: Map<string, number>
   contactToCampaignId: Map<string, string>
-  attribution: LeadsAttributionSummary
+  unresolvedRecords: UnresolvedLeadRecord[]
 }
 
 async function fetchLeadsAttribution(from: string | null, to: string | null): Promise<LeadsAttributionResult> {
@@ -364,19 +448,39 @@ async function fetchLeadsAttribution(from: string | null, to: string | null): Pr
     campaignKeyMap.set(campaignKeyLookupKey(row.platform.toLowerCase() as Platform, row.campaign_name), row.campaign_id)
   }
 
+  const allContactIds = [...new Set(leadRows.map((row) => row.contact_id).filter((id): id is string => Boolean(id)))].sort()
+  const contactInfo = await withCache(`contact-info::${allContactIds.join(',')}`, () => fetchContactInfoMap(allContactIds))
+
   const leadsByCampaignId = new Map<string, number>()
+  const sqlsByCampaignId = new Map<string, number>()
+  const opportunitiesByCampaignId = new Map<string, number>()
+  const customersByCampaignId = new Map<string, number>()
   // First lead (in fetch order) per contact that resolved to a campaign —
   // used to attribute HubSpot deals (which only carry contact_ids) back to a
   // campaign/platform/region for the KPI filters.
   const contactToCampaignId = new Map<string, string>()
-  const unattributedByPlatform: Partial<Record<Platform, number>> = {}
-  const organicByChannel: Partial<Record<OrganicChannel, number>> = {}
+  const unresolvedRecords: UnresolvedLeadRecord[] = []
+
+  function bump(map: Map<string, number>, key: string) {
+    map.set(key, (map.get(key) ?? 0) + 1)
+  }
 
   for (const row of leadRows) {
+    const info = row.contact_id ? contactInfo.get(row.contact_id) : undefined
+    const region = info?.region ?? null
+    const flags: LifecycleFlags = {
+      isSql: info?.isSql ?? false,
+      isOpportunity: info?.isOpportunity ?? false,
+      isCustomer: info?.isCustomer ?? false,
+    }
+
     const hsaCam = (row.forms_hsa_cam ?? '').trim()
 
     if (hsaCam) {
-      leadsByCampaignId.set(hsaCam, (leadsByCampaignId.get(hsaCam) ?? 0) + 1)
+      bump(leadsByCampaignId, hsaCam)
+      if (flags.isSql) bump(sqlsByCampaignId, hsaCam)
+      if (flags.isOpportunity) bump(opportunitiesByCampaignId, hsaCam)
+      if (flags.isCustomer) bump(customersByCampaignId, hsaCam)
       if (row.contact_id && !contactToCampaignId.has(row.contact_id)) {
         contactToCampaignId.set(row.contact_id, hsaCam)
       }
@@ -388,30 +492,30 @@ async function fetchLeadsAttribution(from: string | null, to: string | null): Pr
       const lookupKey = campaignKeyLookupKey(platform, row.forms_hs_utm_campaign ?? '')
       const resolvedId = campaignKeyMap.get(lookupKey)
       if (resolvedId) {
-        leadsByCampaignId.set(resolvedId, (leadsByCampaignId.get(resolvedId) ?? 0) + 1)
+        bump(leadsByCampaignId, resolvedId)
+        if (flags.isSql) bump(sqlsByCampaignId, resolvedId)
+        if (flags.isOpportunity) bump(opportunitiesByCampaignId, resolvedId)
+        if (flags.isCustomer) bump(customersByCampaignId, resolvedId)
         if (row.contact_id && !contactToCampaignId.has(row.contact_id)) {
           contactToCampaignId.set(row.contact_id, resolvedId)
         }
       } else {
-        unattributedByPlatform[platform] = (unattributedByPlatform[platform] ?? 0) + 1
+        unresolvedRecords.push({ kind: 'unattributedPaid', platform, region, ...flags })
       }
       continue
     }
 
     const channel = classifyOrganicChannel(row.forms_hs_utm_source, row.forms_hs_referrer)
-    organicByChannel[channel] = (organicByChannel[channel] ?? 0) + 1
+    unresolvedRecords.push({ kind: 'organic', channel, region, ...flags })
   }
-
-  const unattributedTotal = Object.values(unattributedByPlatform).reduce((sum, n) => sum + (n ?? 0), 0)
-  const organicTotal = Object.values(organicByChannel).reduce((sum, n) => sum + (n ?? 0), 0)
 
   return {
     leadsByCampaignId,
+    sqlsByCampaignId,
+    opportunitiesByCampaignId,
+    customersByCampaignId,
     contactToCampaignId,
-    attribution: {
-      unattributedPaid: { total: unattributedTotal, byPlatform: unattributedByPlatform },
-      organic: { total: organicTotal, byChannel: organicByChannel },
-    },
+    unresolvedRecords,
   }
 }
 
@@ -537,12 +641,21 @@ export async function GET(request: NextRequest) {
           countries: geoEntry ? [...geoEntry.countries] : [],
           leads: leads.leadsByCampaignId.get(row.campaign_id) ?? 0,
           cpl: null,
+          sql: leads.sqlsByCampaignId.get(row.campaign_id) ?? 0,
+          cpsql: null,
+          opportunity: leads.opportunitiesByCampaignId.get(row.campaign_id) ?? 0,
+          cpopportunity: null,
+          customer: leads.customersByCampaignId.get(row.campaign_id) ?? 0,
+          cpcustomer: null,
         })
       }
     }
 
     for (const summary of aggregated.values()) {
       summary.cpl = summary.leads > 0 ? summary.spend / summary.leads : null
+      summary.cpsql = summary.sql > 0 ? summary.spend / summary.sql : null
+      summary.cpopportunity = summary.opportunity > 0 ? summary.spend / summary.opportunity : null
+      summary.cpcustomer = summary.customer > 0 ? summary.spend / summary.customer : null
     }
 
     let data = [...aggregated.values()]
@@ -558,6 +671,55 @@ export async function GET(request: NextRequest) {
     const leadsTotal = data.reduce((sum, row) => sum + row.leads, 0)
     const kpis = computeDealsKpi(dealRows, leads.contactToCampaignId, filteredCampaignIds, leadsTotal)
 
+    // Unattributed/organic leads have no campaign_id, so region comes from
+    // the HubSpot contact instead (resolved in fetchLeadsAttribution) — a
+    // region filter drops any record whose contact region doesn't match,
+    // same as it does for campaign rows above. There's currently no country
+    // filter here: the contact's country is free text (e.g. "Mexico"),
+    // not the ISO codes the country dropdown uses.
+    const regionFilteredRecords = regionParam
+      ? leads.unresolvedRecords.filter((record) => record.region === regionParam)
+      : leads.unresolvedRecords
+
+    const emptyEntry = (): ChannelBreakdownEntry => ({ leads: 0, sql: 0, opportunity: 0, customer: 0 })
+    const unattributedByPlatform: Partial<Record<Platform, ChannelBreakdownEntry>> = {}
+    const organicByChannel: Partial<Record<OrganicChannel, ChannelBreakdownEntry>> = {}
+    for (const record of regionFilteredRecords) {
+      if (record.kind === 'unattributedPaid') {
+        const entry = unattributedByPlatform[record.platform] ?? emptyEntry()
+        entry.leads += 1
+        if (record.isSql) entry.sql += 1
+        if (record.isOpportunity) entry.opportunity += 1
+        if (record.isCustomer) entry.customer += 1
+        unattributedByPlatform[record.platform] = entry
+      } else {
+        const entry = organicByChannel[record.channel] ?? emptyEntry()
+        entry.leads += 1
+        if (record.isSql) entry.sql += 1
+        if (record.isOpportunity) entry.opportunity += 1
+        if (record.isCustomer) entry.customer += 1
+        organicByChannel[record.channel] = entry
+      }
+    }
+    const sumEntries = (bucket: Partial<Record<string, ChannelBreakdownEntry>>, field: keyof ChannelBreakdownEntry) =>
+      Object.values(bucket).reduce((sum, entry) => sum + (entry?.[field] ?? 0), 0)
+    const leadsAttribution: LeadsAttributionSummary = {
+      unattributedPaid: {
+        total: sumEntries(unattributedByPlatform, 'leads'),
+        totalSql: sumEntries(unattributedByPlatform, 'sql'),
+        totalOpportunity: sumEntries(unattributedByPlatform, 'opportunity'),
+        totalCustomer: sumEntries(unattributedByPlatform, 'customer'),
+        byPlatform: unattributedByPlatform,
+      },
+      organic: {
+        total: sumEntries(organicByChannel, 'leads'),
+        totalSql: sumEntries(organicByChannel, 'sql'),
+        totalOpportunity: sumEntries(organicByChannel, 'opportunity'),
+        totalCustomer: sumEntries(organicByChannel, 'customer'),
+        byChannel: organicByChannel,
+      },
+    }
+
     return NextResponse.json({
       data,
       meta: {
@@ -568,7 +730,7 @@ export async function GET(request: NextRequest) {
         country: countryParam ?? null,
         count: data.length,
         geoOptions: geo.geoOptions,
-        leadsAttribution: leads.attribution,
+        leadsAttribution,
         kpis,
       },
     })
