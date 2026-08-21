@@ -23,7 +23,7 @@ const PLATFORM_LABELS: Record<Platform, string> = {
   meta: 'Meta',
   linkedin: 'LinkedIn',
 }
-const PLATFORM_OPTIONS: Array<Platform | 'all'> = ['all', 'google', 'meta', 'linkedin']
+const PLATFORM_OPTIONS: Array<Platform | 'all' | 'other'> = ['all', 'google', 'meta', 'linkedin', 'other']
 
 const ORGANIC_CHANNELS: OrganicChannel[] = [
   'email',
@@ -200,11 +200,13 @@ function PlatformFilterPill({
   onChange,
   label,
   allLabel,
+  otherLabel,
 }: {
-  active: Platform | 'all'
-  onChange: (p: Platform | 'all') => void
+  active: Platform | 'all' | 'other'
+  onChange: (p: Platform | 'all' | 'other') => void
   label: string
   allLabel: string
+  otherLabel: string
 }) {
   return (
     <div>
@@ -246,13 +248,13 @@ function PlatformFilterPill({
                   style={{
                     position: 'absolute',
                     inset: 0,
-                    background: p === 'all' ? T.brand500 : PLATFORM_COLOR[p],
+                    background: p === 'all' ? T.brand500 : p === 'other' ? ACCENT.teal : PLATFORM_COLOR[p],
                     borderRadius: 999,
                     zIndex: -1,
                   }}
                 />
               )}
-              {p === 'all' ? allLabel : PLATFORM_LABELS[p]}
+              {p === 'all' ? allLabel : p === 'other' ? otherLabel : PLATFORM_LABELS[p]}
             </button>
           )
         })}
@@ -654,7 +656,7 @@ export default function Home() {
 
   const [from, setFrom] = useState(currentMonthStart)
   const [to, setTo] = useState(todayLocalDate)
-  const [platform, setPlatform] = useState<Platform | 'all'>('all')
+  const [platform, setPlatform] = useState<Platform | 'all' | 'other'>('all')
   const [region, setRegion] = useState(DEFAULT_REGION)
   const [country, setCountry] = useState('all')
 
@@ -682,7 +684,7 @@ export default function Home() {
         params.set('to', periodTo)
         params.set('leadsTo', localDayBoundaryToIso(periodTo, true))
       }
-      if (platform !== 'all') params.set('platform', platform)
+      if (platform !== 'all' && platform !== 'other') params.set('platform', platform)
       params.set('region', region)
       if (country !== 'all') params.set('country', country)
       return params
@@ -742,11 +744,11 @@ export default function Home() {
     [currentAgg]
   )
 
-  const validationRate = (leadsTotal: number, validatedDeals: number): number | null =>
-    leadsTotal > 0 ? (validatedDeals / leadsTotal) * 100 : null
+  const dealsRate = (leadsTotal: number, dealsCount: number): number | null =>
+    leadsTotal > 0 ? (dealsCount / leadsTotal) * 100 : null
 
-  const currentValidationRate = kpis ? validationRate(kpis.leadsTotal, kpis.validatedDeals) : null
-  const previousValidationRate = previousKpis ? validationRate(previousKpis.leadsTotal, previousKpis.validatedDeals) : null
+  const currentValidationRate = kpis ? dealsRate(kpis.leadsTotal, kpis.dealsCount) : null
+  const previousValidationRate = previousKpis ? dealsRate(previousKpis.leadsTotal, previousKpis.dealsCount) : null
 
   const sortedRows = useMemo(() => {
     const copy = [...rows]
@@ -817,6 +819,7 @@ export default function Home() {
             onChange={setPlatform}
             label={t('filters.platform')}
             allLabel={t('filters.platform.all')}
+            otherLabel={t('filters.platform.other')}
           />
 
           <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12, color: T.inkFaint }}>
@@ -866,7 +869,11 @@ export default function Home() {
 
         {!loading && !error && platform === 'all' && <OverviewSection overview={overview} t={t} />}
 
-        {!loading && !error && platform !== 'all' && (
+        {!loading && !error && platform === 'other' && (
+          <LeadsAttributionSection leadsAttribution={leadsAttribution} t={t} />
+        )}
+
+        {!loading && !error && platform !== 'all' && platform !== 'other' && (
           <>
             <section
               style={{
@@ -919,10 +926,10 @@ export default function Home() {
 
               <SummaryCard
                 label={t('summary.validatedDeals')}
-                value={kpis?.validatedDeals ?? 0}
+                value={kpis?.dealsCount ?? 0}
                 formatValue={(v) => Math.round(v).toLocaleString('pt-BR')}
                 glowColor={ACCENT.purple}
-                changePct={previousKpis ? pctChange(kpis?.validatedDeals ?? 0, previousKpis.validatedDeals) : null}
+                changePct={previousKpis ? pctChange(kpis?.dealsCount ?? 0, previousKpis.dealsCount) : null}
                 index={2 * currencies.length + 1}
               />
 
@@ -1043,8 +1050,6 @@ export default function Home() {
                 </tbody>
               </table>
             </section>
-
-            <LeadsAttributionSection leadsAttribution={leadsAttribution} t={t} />
           </>
         )}
       </main>

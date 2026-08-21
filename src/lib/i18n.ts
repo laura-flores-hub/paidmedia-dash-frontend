@@ -7,6 +7,7 @@ const dict = {
   'filters.dateTo': { pt: 'Até', en: 'To', es: 'Hasta' },
   'filters.platform': { pt: 'View', en: 'View', es: 'View' },
   'filters.platform.all': { pt: 'Overview', en: 'Overview', es: 'Overview' },
+  'filters.platform.other': { pt: 'Other', en: 'Other', es: 'Other' },
   'filters.country': { pt: 'País', en: 'Country', es: 'País' },
   'filters.country.all': { pt: 'Todos', en: 'All', es: 'Todos' },
   'summary.totalSpend': { pt: 'Total investido', en: 'Total spend', es: 'Total invertido' },

@@ -361,45 +361,6 @@ function campaignKeyLookupKey(platform: Platform, campaignName: string): string 
   return `${platform}::${normalize(campaignName)}`
 }
 
-// A deal's meeting can get validated long after the underlying lead was
-// submitted (weeks/months, in practice) — restricting contact→campaign
-// resolution to the currently selected date window meant most validated
-// deals could never be traced back to a campaign, since their lead fell
-// outside that window. This resolves every contact's campaign from the
-// full lead history instead, independent of any date filter, specifically
-// for that lookup (lead/SQL counts by period still use the windowed rows).
-async function fetchAllTimeContactToCampaignId(): Promise<Map<string, string>> {
-  const [leadRows, campaignKeyRows] = await Promise.all([
-    withCache('lead-form-rows::all-time', () => fetchLeadFormRows(null, null)),
-    withCache('campaign-key-rows', fetchCampaignKeyRows),
-  ])
-
-  const campaignKeyMap = new Map<string, string>()
-  for (const row of campaignKeyRows) {
-    campaignKeyMap.set(campaignKeyLookupKey(row.platform.toLowerCase() as Platform, row.campaign_name), row.campaign_id)
-  }
-
-  const contactToCampaignId = new Map<string, string>()
-  for (const row of leadRows) {
-    if (!row.contact_id || contactToCampaignId.has(row.contact_id)) continue
-
-    const hsaCam = (row.forms_hsa_cam ?? '').trim()
-    const platform = platformFromUtmSource(row.forms_hs_utm_source)
-
-    if (hsaCam && platform !== 'linkedin') {
-      contactToCampaignId.set(row.contact_id, hsaCam)
-      continue
-    }
-
-    if (platform) {
-      const resolvedId = campaignKeyMap.get(campaignKeyLookupKey(platform, row.forms_hs_utm_campaign ?? ''))
-      if (resolvedId) contactToCampaignId.set(row.contact_id, resolvedId)
-    }
-  }
-
-  return contactToCampaignId
-}
-
 // data_hs_contacts_v2 is 800k+ rows — never read it unfiltered. Only the
 // contact_ids that actually show up in this request's lead rows are looked
 // up, in indexed `hs_object_id IN (...)` chunks (same pattern as the geo
@@ -496,8 +457,26 @@ async function fetchLeadsAttribution(from: string | null, to: string | null): Pr
   ])
 
   const campaignKeyMap = new Map<string, string>()
+  const campaignIdsByPlatform = new Map<Platform, Set<string>>()
   for (const row of campaignKeyRows) {
-    campaignKeyMap.set(campaignKeyLookupKey(row.platform.toLowerCase() as Platform, row.campaign_name), row.campaign_id)
+    const platform = row.platform.toLowerCase() as Platform
+    campaignKeyMap.set(campaignKeyLookupKey(platform, row.campaign_name), row.campaign_id)
+    let ids = campaignIdsByPlatform.get(platform)
+    if (!ids) {
+      ids = new Set()
+      campaignIdsByPlatform.set(platform, ids)
+    }
+    ids.add(row.campaign_id)
+  }
+
+  // forms_hs_utm_campaign sometimes holds the campaign's real ID directly
+  // instead of its name (observed for Google leads without forms_hsa_cam) —
+  // in that case the name lookup below would never match, incorrectly
+  // dumping the lead into "unattributedPaid". Recognize that case first.
+  function resolveCampaignId(platform: Platform, utmCampaign: string | null): string | undefined {
+    const utm = (utmCampaign ?? '').trim()
+    if (utm && campaignIdsByPlatform.get(platform)?.has(utm)) return utm
+    return campaignKeyMap.get(campaignKeyLookupKey(platform, utm))
   }
 
   const allContactIds = [...new Set(leadRows.map((row) => row.contact_id).filter((id): id is string => Boolean(id)))].sort()
@@ -547,8 +526,7 @@ async function fetchLeadsAttribution(from: string | null, to: string | null): Pr
     }
 
     if (platform) {
-      const lookupKey = campaignKeyLookupKey(platform, row.forms_hs_utm_campaign ?? '')
-      const resolvedId = campaignKeyMap.get(lookupKey)
+      const resolvedId = resolveCampaignId(platform, row.forms_hs_utm_campaign)
       if (resolvedId) {
         bump(leadsByCampaignId, resolvedId)
         if (flags.isSql) bump(sqlsByCampaignId, resolvedId)
@@ -582,47 +560,87 @@ type DealRow = {
   contact_ids: string[] | null
   first_meeting_status: string | null
   dealstage: string | null
+  pipeline: string | null
 }
 
-const VALIDATED_MEETING_STATUS = 'Validated'
 const DISQUALIFIED_MEETING_STATUS = 'No Fit'
+const CUSTOMER_JOURNEY_PIPELINE = 'Humand Customer Journey'
 
+// Deals are dated by first_meeting_date when it's set (falls back to
+// createdate otherwise) — the meeting can happen long after the deal record
+// was created, so createdate alone misdates when a deal actually belongs to
+// a period.
 async function fetchDealRows(leadsFrom: string | null, leadsTo: string | null): Promise<DealRow[]> {
   const supabase = getSupabaseClient()
   return fetchAllRows<DealRow>(() => {
     let query = supabase
       .from('data_hs_deals_v2')
-      .select('hs_object_id, contact_ids, first_meeting_status, dealstage, createdate')
-    if (leadsFrom) query = query.gte('createdate', leadsFrom)
-    if (leadsTo) query = query.lte('createdate', leadsTo)
+      .select('hs_object_id, contact_ids, first_meeting_status, dealstage, pipeline, createdate, first_meeting_date')
+    if (leadsFrom || leadsTo) {
+      const rangeFilter = (column: string) =>
+        [leadsFrom ? `${column}.gte.${leadsFrom}` : null, leadsTo ? `${column}.lte.${leadsTo}` : null]
+          .filter(Boolean)
+          .join(',')
+      query = query.or(
+        `and(first_meeting_date.not.is.null,${rangeFilter('first_meeting_date')}),and(first_meeting_date.is.null,${rangeFilter('createdate')})`
+      )
+    }
     return query
   }, 'data_hs_deals_v2')
 }
 
-type DealsKpi = { leadsTotal: number; validatedDeals: number }
+const DEAL_CONTACT_CHUNK_SIZE = 150
+const DEAL_CONTACT_CONCURRENCY = 4
 
-// A deal only carries contact_ids, not a campaign — it's attributed via the
-// first associated contact that itself resolved to a campaign (same
-// resolution as fetchLeadsAttribution), then kept only if that campaign is
-// part of the currently filtered campaign set (platform/region/country).
-function computeDealsKpi(
-  dealRows: DealRow[],
-  contactToCampaignId: Map<string, string>,
-  filteredCampaignIds: Set<string>,
-  leadsTotal: number
-): DealsKpi {
-  let validatedDeals = 0
+async function fetchDealRowsForContactsChunk(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  contactIds: string[],
+  attempt = 1
+): Promise<DealRow[]> {
+  const { data, error } = await supabase
+    .from('data_hs_deals_v2')
+    .select('hs_object_id, contact_ids, first_meeting_status, dealstage, pipeline')
+    .overlaps('contact_ids', contactIds)
 
-  for (const deal of dealRows) {
-    const campaignId = (deal.contact_ids ?? [])
-      .map((contactId) => contactToCampaignId.get(contactId))
-      .find((id): id is string => Boolean(id))
-
-    if (!campaignId || !filteredCampaignIds.has(campaignId)) continue
-    if (deal.first_meeting_status === VALIDATED_MEETING_STATUS) validatedDeals += 1
+  if (error) {
+    if (attempt < 3) return fetchDealRowsForContactsChunk(supabase, contactIds, attempt + 1)
+    throw new Error(`Falha ao consultar data_hs_deals_v2 no Supabase: ${error.message}`)
   }
 
-  return { leadsTotal, validatedDeals }
+  return data ?? []
+}
+
+// The validated-deals KPI is scoped to the contacts already identified by
+// the current filters (platform/region/country/date) — i.e. the same
+// contacts counted in the leads total — not by any date on the deal itself.
+// A deal's meeting can happen long after (or before) its contact's lead was
+// submitted, so filtering deals by their own date would misrepresent which
+// period they belong to. This fetches every deal associated with those
+// specific contacts, regardless of the deal's own dates.
+async function fetchDealRowsForContacts(contactIds: string[]): Promise<DealRow[]> {
+  if (contactIds.length === 0) return []
+
+  const supabase = getSupabaseClient()
+  const chunks = chunk(contactIds, DEAL_CONTACT_CHUNK_SIZE)
+  const results = await runWithConcurrency(chunks, DEAL_CONTACT_CONCURRENCY, (ids) =>
+    fetchDealRowsForContactsChunk(supabase, ids)
+  )
+
+  const byId = new Map<string, DealRow>()
+  for (const deal of results.flat()) byId.set(deal.hs_object_id, deal)
+  return [...byId.values()]
+}
+
+type DealsKpi = { leadsTotal: number; dealsCount: number }
+
+// dealRows here is already scoped to the right contacts (see
+// fetchDealRowsForContacts) — a deal counts toward this KPI simply by
+// existing in the Humand Customer Journey pipeline; the meeting status
+// (Booked/Validated/No Show/...) doesn't matter — other pipelines (BDRs,
+// Partnerships, ...) aren't part of the paid-media inbound funnel.
+function computeDealsKpi(dealRows: DealRow[], leadsTotal: number): DealsKpi {
+  const dealsCount = dealRows.filter((deal) => deal.pipeline === CUSTOMER_JOURNEY_PIPELINE).length
+  return { leadsTotal, dealsCount }
 }
 
 type OverviewContactRow = {
@@ -770,19 +788,19 @@ export async function GET(request: NextRequest) {
   const wantsOverview = !platformParam && Boolean(regionParam)
 
   try {
-    const [spendResults, currencyMap, leads, dealRows, overviewContacts, allTimeContactToCampaignId] =
-      await Promise.all([
-        Promise.all(
-          platformsToFetch.map((platform) =>
-            withCache(`spend::${platform}::${from}::${to}`, () => FETCHERS[platform](from, to))
-          )
-        ),
-        fetchCurrencyMap(),
-        fetchLeadsAttribution(leadsFrom, leadsTo),
-        withCache(`deal-rows::${leadsFrom}::${leadsTo}`, () => fetchDealRows(leadsFrom, leadsTo)),
-        wantsOverview ? fetchOverviewContacts(regionParam as string, leadsFrom, leadsTo) : Promise.resolve(null),
-        withCache('contact-to-campaign::all-time', fetchAllTimeContactToCampaignId),
-      ])
+    const [spendResults, currencyMap, leads, overviewDealRows, overviewContacts] = await Promise.all([
+      Promise.all(
+        platformsToFetch.map((platform) =>
+          withCache(`spend::${platform}::${from}::${to}`, () => FETCHERS[platform](from, to))
+        )
+      ),
+      fetchCurrencyMap(),
+      fetchLeadsAttribution(leadsFrom, leadsTo),
+      wantsOverview
+        ? withCache(`deal-rows::${leadsFrom}::${leadsTo}`, () => fetchDealRows(leadsFrom, leadsTo))
+        : Promise.resolve([]),
+      wantsOverview ? fetchOverviewContacts(regionParam as string, leadsFrom, leadsTo) : Promise.resolve(null),
+    ])
     const rawRows = spendResults.flat()
     const campaignIds = [...new Set(rawRows.map((row) => row.campaign_id))]
     const geo = await fetchGeoBridge(campaignIds)
@@ -852,7 +870,15 @@ export async function GET(request: NextRequest) {
 
     const filteredCampaignIds = new Set(data.map((row) => row.campaign_id))
     const leadsTotal = data.reduce((sum, row) => sum + row.leads, 0)
-    const kpis = computeDealsKpi(dealRows, allTimeContactToCampaignId, filteredCampaignIds, leadsTotal)
+
+    // The contacts already identified by the current filters (same universe
+    // as leadsTotal above) — their associated deals decide the
+    // validated-deals KPI, regardless of any date on the deal itself.
+    const kpiContactIds = [...leads.contactToCampaignId.entries()]
+      .filter(([, campaignId]) => filteredCampaignIds.has(campaignId))
+      .map(([contactId]) => contactId)
+    const dealRowsForKpi = await fetchDealRowsForContacts(kpiContactIds)
+    const kpis = computeDealsKpi(dealRowsForKpi, leadsTotal)
 
     // Unattributed/organic leads have no campaign_id, so region comes from
     // the HubSpot contact instead (resolved in fetchLeadsAttribution) — a
@@ -903,7 +929,7 @@ export async function GET(request: NextRequest) {
       },
     }
 
-    const overview = overviewContacts ? computeInboundOverview(overviewContacts, dealRows) : null
+    const overview = overviewContacts ? computeInboundOverview(overviewContacts, overviewDealRows) : null
 
     return NextResponse.json({
       data,

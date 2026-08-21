@@ -71,7 +71,7 @@ export type LeadsAttributionSummary = {
 
 export type DealsKpi = {
   leadsTotal: number
-  validatedDeals: number
+  dealsCount: number
 }
 
 export type StageBreakdown = Record<string, number>
