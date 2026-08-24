@@ -24,6 +24,10 @@ const PLATFORM_LABELS: Record<Platform, string> = {
   linkedin: 'LinkedIn',
 }
 const PLATFORM_OPTIONS: Array<Platform | 'all' | 'other'> = ['all', 'google', 'meta', 'linkedin', 'other']
+// Overview ("all") is hidden from the View switcher until its data issues
+// are sorted out — kept in PLATFORM_OPTIONS/OverviewSection so it's a small
+// change to bring back, just not user-facing for now.
+const VISIBLE_PLATFORM_OPTIONS: Array<Platform | 'all' | 'other'> = PLATFORM_OPTIONS.filter((p) => p !== 'all')
 
 const ORGANIC_CHANNELS: OrganicChannel[] = [
   'email',
@@ -221,7 +225,7 @@ function PlatformFilterPill({
           boxShadow: T.shadow4,
         }}
       >
-        {PLATFORM_OPTIONS.map((p) => {
+        {VISIBLE_PLATFORM_OPTIONS.map((p) => {
           const isActive = p === active
           return (
             <button
@@ -520,7 +524,7 @@ function LeadsAttributionSection({
 }) {
   const emptyEntry = { leads: 0, sql: 0, opportunity: 0, customer: 0 }
 
-  const platformRows = PLATFORM_OPTIONS.filter((p): p is Platform => p !== 'all')
+  const platformRows = PLATFORM_OPTIONS.filter((p): p is Platform => p !== 'all' && p !== 'other')
     .map((p) => ({ label: PLATFORM_LABELS[p], ...(leadsAttribution.unattributedPaid.byPlatform[p] ?? emptyEntry) }))
     .filter((r) => r.leads > 0)
 
@@ -656,7 +660,7 @@ export default function Home() {
 
   const [from, setFrom] = useState(currentMonthStart)
   const [to, setTo] = useState(todayLocalDate)
-  const [platform, setPlatform] = useState<Platform | 'all' | 'other'>('all')
+  const [platform, setPlatform] = useState<Platform | 'all' | 'other'>('google')
   const [region, setRegion] = useState(DEFAULT_REGION)
   const [country, setCountry] = useState('all')
 
